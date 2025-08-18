@@ -63,8 +63,21 @@ async def main():
     # functionality
     #################################################
 
-    # Initialize Graphiti with Neo4j connection
-    graphiti = Graphiti(neo4j_uri, neo4j_user, neo4j_password)
+    # Initialize Graphiti with Neo4j connection and custom embedding model for LM Studio
+    from graphiti_core.embedder import OpenAIEmbedderConfig, OpenAIEmbedder
+    
+    # Configure embedder to use LM Studio's embedding model
+    embedder_config = OpenAIEmbedderConfig(
+        embedding_model='text-embedding-nomic-embed-text-v1.5',
+        embedding_dim=768,  # Adjust this based on the actual dimension of nomic-embed-text-v1.5
+        api_key='lm-studio',
+        base_url='http://localhost:1234/v1'
+    )
+    
+    # Create embedder client
+    embedder = OpenAIEmbedder(config=embedder_config)
+    
+    graphiti = Graphiti(neo4j_uri, neo4j_user, neo4j_password, embedder=embedder)
 
     try:
         # Initialize the graph database with graphiti's indices. This only needs to be done once.
