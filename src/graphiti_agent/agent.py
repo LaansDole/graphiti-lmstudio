@@ -6,8 +6,12 @@ from dotenv import load_dotenv
 from rich.markdown import Markdown
 from rich.console import Console
 from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
 import asyncio
 import os
+import logging
 
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.openai import OpenAIModel
@@ -15,6 +19,13 @@ from pydantic_ai import Agent, RunContext
 from graphiti_core import Graphiti
 
 load_dotenv()
+
+# Configure logging to be less verbose unless there are errors
+logging.basicConfig(level=logging.WARNING)
+# Suppress specific noisy loggers
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('openai').setLevel(logging.WARNING)
 
 # ========== Define dependencies ==========
 @dataclass
@@ -42,9 +53,17 @@ def get_model():
 graphiti_agent = Agent(
     get_model(),
     system_prompt="""You are a helpful assistant with access to a knowledge graph filled with temporal data about LLMs.
-    When the user asks you a question, use your search tool to query the knowledge graph and then answer honestly.
-    Be willing to admit when you didn't find the information necessary to answer the question.""",
-    deps_type=GraphitiDependencies
+    
+    When the user asks you a question, you should:
+    1. Use your search tool to query the knowledge graph for relevant information
+    2. If the search returns results, use that information to answer the question
+    3. If the search returns no results or fails, acknowledge that you don't have specific information about that topic in the knowledge graph
+    4. Always be honest about what information you found or didn't find
+    5. You can still provide general knowledge if the knowledge graph doesn't contain specific information
+    
+    Be conversational and helpful, but always be clear about what information comes from the knowledge graph versus your general knowledge.""",
+    deps_type=GraphitiDependencies,
+    retries=1  # Limit retries to prevent loops
 )
 
 # ========== Define a result model for Graphiti search ==========
@@ -73,7 +92,9 @@ async def search_graphiti(ctx: RunContext[GraphitiDependencies], query: str) -> 
     
     try:
         # Perform the search
+        logging.info(f"Searching Graphiti with query: {query}")
         results = await graphiti.search(query)
+        logging.info(f"Found {len(results)} results")
         
         # Format the results
         formatted_results = []
@@ -94,54 +115,77 @@ async def search_graphiti(ctx: RunContext[GraphitiDependencies], query: str) -> 
         
         return formatted_results
     except Exception as e:
-        # Log the error but don't close the connection since it's managed by the dependency
-        print(f"Error searching Graphiti: {str(e)}")
-        raise
+        # Log the error with more detail
+        logging.error(f"Error searching Graphiti: {type(e).__name__}: {str(e)}")
+        # Return empty results instead of raising to prevent tool retry loops
+        return []
 
 # ========== Main execution function ==========
 async def main():
     """Run the Graphiti agent with user queries."""
-    print("Graphiti Agent - Powered by Pydantic AI, Graphiti, Neo4j, and LM Studio")
-    print("Enter 'exit' to quit the program.")
+    console = Console()
     
-    # Display LM Studio configuration
+    # Create a nice welcome banner
+    welcome_table = Table.grid(padding=1)
+    welcome_table.add_column(style="cyan bold", justify="center")
+    welcome_table.add_row("🤖 Graphiti AI Agent")
+    welcome_table.add_row("[dim]Powered by Pydantic AI, Graphiti, Neo4j, and LM Studio[/dim]")
+    
+    console.print(Panel(welcome_table, title="[bold blue]Welcome[/bold blue]", border_style="blue"))
+    
+    # Display configuration info
     lm_studio_host = os.getenv('LMSTUDIO_API_HOST', 'http://127.0.0.1:1234/v1')
     model_choice = os.getenv('MODEL_CHOICE', 'openai/gpt-oss-20b')
-    print(f"LM Studio Host: {lm_studio_host}")
-    print(f"Model: {model_choice}")
+    
+    config_table = Table(show_header=False, box=None)
+    config_table.add_column("Key", style="cyan")
+    config_table.add_column("Value", style="white")
+    config_table.add_row("🌐 LM Studio Host:", lm_studio_host)
+    config_table.add_row("🧠 Model:", model_choice)
+    config_table.add_row("💬 Commands:", "[dim]Type 'exit' to quit[/dim]")
+    
+    console.print(Panel(config_table, title="[bold green]Configuration[/bold green]", border_style="green"))
 
     # Neo4j connection parameters
     neo4j_uri = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
     neo4j_user = os.environ.get('NEO4J_USER', 'neo4j')
     neo4j_password = os.environ.get('NEO4J_PASSWORD', 'password')
     
-    # Initialize Graphiti with Neo4j connection
-    graphiti_client = Graphiti(neo4j_uri, neo4j_user, neo4j_password)
+    # Initialize Graphiti with LM Studio configuration
+    from .llm_config import create_graphiti_client
+    
+    graphiti_client = create_graphiti_client(neo4j_uri, neo4j_user, neo4j_password)
     
     # Initialize the graph database with graphiti's indices if needed
     try:
         await graphiti_client.build_indices_and_constraints()
-        print("Graphiti indices built successfully.")
+        console.print("✅ [green]Graphiti indices built successfully[/green]")
+        
+        # Optional: Clear any inconsistent entity type data
+        # This helps resolve entity_type_id warnings
+        from graphiti_core.utils.maintenance.graph_data_operations import clear_data
+        # Uncomment the next line if you want to start with a completely fresh database
+        await clear_data(graphiti_client.driver)
+        
     except Exception as e:
-        print(f"Note: {str(e)}")
-        print("Continuing with existing indices...")
+        console.print(f"ℹ️  [yellow]Using existing indices: {str(e)}[/yellow]")
 
-    console = Console()
     messages = []
     
     try:
         while True:
-            # Get user input
-            user_input = input("\n[You] ")
+            # Get user input with emoji
+            console.print("\n👤 ", style="bold blue", end="")
+            user_input = input()
             
             # Check if user wants to exit
             if user_input.lower() in ['exit', 'quit', 'bye', 'goodbye']:
-                print("Goodbye!")
+                console.print("👋 [bold cyan]Goodbye![/bold cyan]")
                 break
             
             try:
                 # Process the user input and output the response
-                print("\n[Assistant]")
+                console.print("🤖 ", style="bold green", end="")
                 with Live('', console=console, vertical_overflow='visible') as live:
                     # Pass the Graphiti client as a dependency
                     deps = GraphitiDependencies(graphiti_client=graphiti_client)
@@ -159,26 +203,32 @@ async def main():
                 
             except Exception as e:
                 error_msg = str(e)
-                print(f"\n[Error] An error occurred: {error_msg}")
+                console.print(f"\n❌ [bold red]Error:[/bold red] {error_msg}")
                 
                 # Provide helpful LM Studio troubleshooting tips
                 if "connection" in error_msg.lower() or "refused" in error_msg.lower():
-                    print("\nLM Studio Troubleshooting:")
-                    print("1. Ensure LM Studio server is running")
-                    print(f"2. Check that the server is accessible at: {os.getenv('LMSTUDIO_API_HOST', 'http://127.0.0.1:1234/v1')}")
-                    print(f"3. Verify that model '{os.getenv('MODEL_CHOICE', 'openai/gpt-oss-20b')}' is loaded")
-                    print("4. Check that just-in-time model loading is enabled if model isn't pre-loaded")
-                    print("See https://lmstudio.ai/docs/basics/server for more information")
+                    troubleshoot_table = Table(show_header=False, box=None)
+                    troubleshoot_table.add_column("Step", style="cyan")
+                    troubleshoot_table.add_column("Description", style="white")
+                    troubleshoot_table.add_row("1.", "Ensure LM Studio server is running")
+                    troubleshoot_table.add_row("2.", f"Check server accessibility: {os.getenv('LMSTUDIO_API_HOST', 'http://127.0.0.1:1234/v1')}")
+                    troubleshoot_table.add_row("3.", f"Verify model is loaded: '{os.getenv('MODEL_CHOICE', 'openai/gpt-oss-20b')}'")
+                    troubleshoot_table.add_row("4.", "Enable just-in-time model loading if needed")
+                    troubleshoot_table.add_row("5.", "Visit: https://lmstudio.ai/docs/basics/server")
+                    
+                    console.print(Panel(troubleshoot_table, title="[bold yellow]🔧 LM Studio Troubleshooting[/bold yellow]", border_style="yellow"))
     finally:
         # Close the Graphiti connection when done
         await graphiti_client.close()
-        print("\nGraphiti connection closed.")
+        console.print("\n🔌 [dim]Graphiti connection closed.[/dim]")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nProgram terminated by user.")
+        console = Console()
+        console.print("\n⏹️  [bold yellow]Program terminated by user.[/bold yellow]")
     except Exception as e:
-        print(f"\nUnexpected error: {str(e)}")
+        console = Console()
+        console.print(f"\n💥 [bold red]Unexpected error:[/bold red] {str(e)}")
         raise

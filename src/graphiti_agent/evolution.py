@@ -10,13 +10,14 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from logging import INFO
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +36,56 @@ neo4j_password = os.environ.get('NEO4J_PASSWORD', 'password')
 
 if not neo4j_uri or not neo4j_user or not neo4j_password:
     raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+
+
+def load_lmstudio_models():
+    """Load required models in LM Studio using the lms command."""
+    # Get models from environment variables
+    chat_model = os.environ.get('MODEL_CHOICE', 'llama-3.2-1b-instruct')
+    embedding_model = os.environ.get('OPENAI_EMBEDDING_MODEL', 'text-embedding-nomic-embed-text-v1.5')
+    
+    # Extract just the model name without 'text-embedding-' prefix for lms command
+    embedding_model_name = embedding_model.replace('text-embedding-', '') if embedding_model.startswith('text-embedding-') else embedding_model
+    
+    models_to_load = [
+        chat_model,              # Chat completion model from .env
+        embedding_model_name     # Embedding model from .env
+    ]
+    
+    print("Loading required models in LM Studio...")
+    
+    for model in models_to_load:
+        try:
+            print(f"Loading {model}...")
+            result = subprocess.run(
+                ['lms', 'load', model],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',  # Explicitly specify UTF-8 encoding
+                errors='replace',  # Replace problematic characters instead of failing
+                timeout=60  # 60 second timeout
+            )
+            
+            if result.returncode == 0:
+                print(f"✅ Successfully loaded {model}")
+            else:
+                print(f"⚠️  Warning: Failed to load {model}")
+                print(f"   Error: {result.stderr}")
+                print(f"   Output: {result.stdout}")
+                
+        except subprocess.TimeoutExpired:
+            print(f"⚠️  Timeout loading {model} (this is normal for large models)")
+        except FileNotFoundError:
+            print("❌ Error: 'lms' command not found. Please ensure LM Studio CLI is installed and in PATH.")
+            print("   You can install it from: https://lmstudio.ai/")
+            return False
+        except Exception as e:
+            print(f"⚠️  Unexpected error loading {model}: {e}")
+    
+    print("Model loading completed. Waiting a moment for models to initialize...")
+    import time
+    time.sleep(5)  # Give models time to fully load
+    return True
 
 
 async def add_episodes(graphiti, episodes, prefix="LLM Evolution"):
@@ -275,17 +326,21 @@ async def phase3_mlm_revolution(graphiti):
 
 async def main():
     """Main function to run the LLM evolution demonstration."""
-    # Initialize Graphiti with Neo4j connection
-    graphiti = Graphiti(neo4j_uri, neo4j_user, neo4j_password)
+    
+    # Load required models in LM Studio first
+    if not load_lmstudio_models():
+        print("❌ Failed to load required models. Please check LM Studio setup.")
+        return
+    
+    # Initialize Graphiti with LM Studio configuration
+    from .llm_config import create_graphiti_client, initialize_graphiti_with_clean_state
+    from graphiti_core.utils.maintenance.graph_data_operations import clear_data
+    
+    graphiti = create_graphiti_client(neo4j_uri, neo4j_user, neo4j_password)
 
     try:
-        # Initialize the graph database with graphiti's indices
-        await graphiti.build_indices_and_constraints()
-        
-        # Clear existing data
-        print("Clearing existing graph data...")
-        await clear_data(graphiti.driver)
-        print("Graph data cleared successfully.")
+        # Initialize with clean state to prevent entity type warnings
+        await initialize_graphiti_with_clean_state(graphiti, clear_data)
         
         # Phase 1: Current top LLMs with Gemini 2.5 Pro as the best
         await phase1_current_llms(graphiti)
